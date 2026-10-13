@@ -1,0 +1,135 @@
+name: windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache: false
+
+      - name: Go vet + unit tests
+        working-directory: windows
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Build keepawake.exe (amd64 + arm64)
+        working-directory: windows
+        run: |
+          $env:CGO_ENABLED = '0'
+          $env:GOARCH = 'amd64'; go build -trimpath -ldflags "-s -w" -o ..\dist\amd64\keepawake.exe .
+          $env:GOARCH = 'arm64'; go build -trimpath -ldflags "-s -w" -o ..\dist\arm64\keepawake.exe .
+
+      - name: Run keepawake.exe 5s
+        run: |
+          $out = & .\dist\amd64\keepawake.exe 5s 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { throw "exit $code" }
+          foreach ($want in 'SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED) ok', 'time is up', 'normal sleep restored') {
+            if (-not $out.Contains($want)) { throw "missing log line: $want" }
+          }
+          & .\dist\amd64\keepawake.exe soon *> $null
+          if ($LASTEXITCODE -ne 2) { throw "bad duration: exit $LASTEXITCODE, want 2" }
+          $global:LASTEXITCODE = 0
+
+      - name: Pester (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -RequiredVersion 5.7.1
+          $r = Invoke-Pester -Path windows\tests -Output Detailed -PassThru
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { throw 'Pester failed' }
+
+      - name: Pester (PowerShell 7)
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -RequiredVersion 5.7.1
+          $r = Invoke-Pester -Path windows\tests -Output Detailed -PassThru
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { throw 'Pester failed' }
+
+      - name: Run keepawake.ps1 5s (Windows PowerShell 5.1)
+        run: |
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -File windows\keepawake.ps1 5s 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { throw "exit $code" }
+          foreach ($want in 'SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED) ok', 'time is up', 'normal sleep restored') {
+            if (-not $out.Contains($want)) { throw "missing log line: $want" }
+          }
+
+      - name: Run keepawake.ps1 in Constrained Language Mode
+        run: |
+          $cmd = '$ExecutionContext.SessionState.LanguageMode = "ConstrainedLanguage"; & .\windows\keepawake.ps1 5s; exit $LASTEXITCODE'
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          # 1 = nothing could be covered; 0 = presentation mode covered "awake" for the 5 s.
+          if ($code -notin 0, 1) { throw "exit $code" }
+          foreach ($want in 'Constrained Language Mode', 'presence: NOT covered') {
+            if (-not $out.Contains($want)) { throw "missing: $want" }
+          }
+          if ($out -match 'SetThreadExecutionState\(') { throw 'CLM run must not claim Win32 access' }
+          $global:LASTEXITCODE = 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache: false
+
+      - name: Build and zip
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $env:CGO_ENABLED = '0'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          foreach ($arch in 'amd64', 'arm64') {
+            $dir = "dist\keepawake-$env:VERSION-windows-$arch"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Push-Location windows
+            $env:GOARCH = $arch
+            go build -trimpath -ldflags "-s -w -X main.version=$env:VERSION" -o "..\$dir\keepawake.exe" .
+            if ($LASTEXITCODE -ne 0) { throw "go build $arch failed" }
+            Pop-Location
+            Copy-Item windows\keepawake.ps1, README.md, LICENSE $dir
+            Compress-Archive -Path "$dir\*" -DestinationPath "$dir.zip" -Force
+          }
+          Get-ChildItem dist\*.zip | ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $pre = @()
+          if ($env:VERSION.Contains('-')) { $pre = @('--prerelease') }
+          gh release create $env:VERSION --title "keepawake $env:VERSION" --generate-notes --verify-tag @pre `
+            (Get-ChildItem dist\*.zip).FullName dist\SHA256SUMS.txt
