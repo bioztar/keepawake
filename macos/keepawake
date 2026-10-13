@@ -1,0 +1,52 @@
+#!/bin/bash
+# keepawake — keep the Mac awake and your Teams status active.
+#   keepawake            run until Ctrl+C (default: nudge every 4 min)
+#   keepawake 2h         stop after 2 hours (accepts 30m, 2h, 90s)
+#   KEEPAWAKE_EVERY=60 keepawake     nudge interval in seconds (default 30; Teams goes Away at 5 min idle)
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BIN="$DIR/.bin/nudge"
+EVERY="${KEEPAWAKE_EVERY:-30}"
+
+if [[ ! -x "$BIN" || "$DIR/nudge.swift" -nt "$BIN" ]]; then
+  mkdir -p "$DIR/.bin"
+  swiftc -O "$DIR/nudge.swift" -o "$BIN"
+fi
+
+seconds() {
+  case "$1" in
+    *h) echo $(( ${1%h} * 3600 )) ;;
+    *m) echo $(( ${1%m} * 60 )) ;;
+    *s) echo "${1%s}" ;;
+    *)  echo "$1" ;;
+  esac
+}
+DEADLINE=""
+[[ $# -gt 0 ]] && DEADLINE=$(( $(date +%s) + $(seconds "$1") ))
+
+# -d display, -i idle sleep, -m disk, -s system (on AC), -u declare user active
+caffeinate -dimsu -w $$ &
+echo "keepawake: on (nudge every ${EVERY}s${DEADLINE:+, until $(date -r "$DEADLINE" +%H:%M)}). Ctrl+C to stop."
+trap 'echo; echo "keepawake: off"; exit 0' INT TERM
+
+idle() { ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}'; }
+
+WARNED=""
+while :; do
+  "$BIN"
+  # Self-check: a working nudge drops system idle time to ~0. If it doesn't, macOS is
+  # silently dropping the synthetic events (Accessibility not granted) and Teams will go Away.
+  if [[ -z "$WARNED" && $(idle) -gt 5 ]]; then
+    echo "keepawake: WARNING — the nudge is not resetting idle time. Allow your terminal app in"
+    echo "  System Settings → Privacy & Security → Accessibility, then restart keepawake."
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+    WARNED=1
+  fi
+  NAP=$EVERY
+  if [[ -n "$DEADLINE" ]]; then
+    LEFT=$(( DEADLINE - $(date +%s) ))
+    (( LEFT <= 0 )) && { echo "keepawake: time is up, off"; exit 0; }
+    (( LEFT < NAP )) && NAP=$LEFT
+  fi
+  sleep "$NAP"
+done
