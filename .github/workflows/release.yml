@@ -28,25 +28,45 @@ jobs:
           go vet ./...
           go test -v ./...
 
-      - name: Build keepawake.exe (amd64 + arm64)
+      - name: Build keepawake.exe (x64 + arm64, no console)
         working-directory: windows
         run: |
           $env:CGO_ENABLED = '0'
-          $env:GOARCH = 'amd64'; go build -trimpath -ldflags "-s -w" -o ..\dist\amd64\keepawake.exe .
-          $env:GOARCH = 'arm64'; go build -trimpath -ldflags "-s -w" -o ..\dist\arm64\keepawake.exe .
+          $env:GOARCH = 'amd64'; go build -trimpath -ldflags "-s -w -H=windowsgui" -o ..\dist\keepawake-windows-x64.exe .
+          if ($LASTEXITCODE -ne 0) { throw 'build x64' }
+          $env:GOARCH = 'arm64'; go build -trimpath -ldflags "-s -w -H=windowsgui" -o ..\dist\keepawake-windows-arm64.exe .
+          if ($LASTEXITCODE -ne 0) { throw 'build arm64' }
 
-      - name: Run keepawake.exe 5s
+      - name: Smoke - tray exe on for 5 s
         run: |
-          $out = & .\dist\amd64\keepawake.exe 5s 2>&1 | Out-String
-          $code = $LASTEXITCODE
+          $exe = (Resolve-Path dist\keepawake-windows-x64.exe).Path
+          # PE optional header Subsystem: 2 = Windows GUI (no console window).
+          $b = [IO.File]::ReadAllBytes($exe); $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $sub = [BitConverter]::ToUInt16($b, $pe + 24 + 68)
+          if ($sub -ne 2) { throw "subsystem $sub, want 2 (GUI)" }
+          $log = "$env:LOCALAPPDATA\keepawake\keepawake.log"
+          Remove-Item "$log*" -ErrorAction SilentlyContinue
+          $env:KEEPAWAKE_EVERY = '2'
+          $p = Start-Process $exe -ArgumentList '--on', '5s', '--quit-when-off' -PassThru
+          $null = $p.Handle
+          Start-Sleep 2
+          $second = Start-Process $exe -PassThru -Wait
+          if ($second.ExitCode -ne 0) { throw "second launch exit $($second.ExitCode)" }
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw 'keepawake did not exit after 5 s' }
+          $out = Get-Content $log -Raw
           Write-Host $out
-          if ($code -ne 0) { throw "exit $code" }
-          foreach ($want in 'SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED) ok', 'time is up', 'normal sleep restored') {
+          if ($p.ExitCode -ne 0) { throw "exit $($p.ExitCode)" }
+          foreach ($want in 'SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED) ok',
+              'nudge ok (mouse): idle', 'SetThreadExecutionState(ES_CONTINUOUS) ok - normal sleep restored',
+              'off (time is up)', 'notification: keepawake off - PC can sleep again.', 'second launch',
+              'another keepawake was started', 'exit') {
             if (-not $out.Contains($want)) { throw "missing log line: $want" }
           }
-          & .\dist\amd64\keepawake.exe soon *> $null
-          if ($LASTEXITCODE -ne 2) { throw "bad duration: exit $LASTEXITCODE, want 2" }
-          $global:LASTEXITCODE = 0
+          if ($out -match 'WARNING|ERROR') { throw 'unexpected warning in log' }
+          $run = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).keepawake
+          Write-Host "Run key: $run"
+          if ($run -ne "`"$exe`" --autostart") { throw "Run key = $run" }
+          Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name keepawake
 
       - name: Pester (Windows PowerShell 5.1)
         shell: powershell
@@ -108,19 +128,17 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           $env:CGO_ENABLED = '0'
-          New-Item -ItemType Directory -Force dist | Out-Null
-          foreach ($arch in 'amd64', 'arm64') {
-            $dir = "dist\keepawake-$env:VERSION-windows-$arch"
-            New-Item -ItemType Directory -Force $dir | Out-Null
-            Push-Location windows
-            $env:GOARCH = $arch
-            go build -trimpath -ldflags "-s -w -X main.version=$env:VERSION" -o "..\$dir\keepawake.exe" .
-            if ($LASTEXITCODE -ne 0) { throw "go build $arch failed" }
-            Pop-Location
-            Copy-Item windows\keepawake.ps1, README.md, LICENSE $dir
-            Compress-Archive -Path "$dir\*" -DestinationPath "$dir.zip" -Force
+          New-Item -ItemType Directory -Force dist\zip | Out-Null
+          Push-Location windows
+          foreach ($a in @{ go = 'amd64'; name = 'x64' }, @{ go = 'arm64'; name = 'arm64' }) {
+            $env:GOARCH = $a.go
+            go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$env:VERSION" -o "..\dist\keepawake-windows-$($a.name).exe" .
+            if ($LASTEXITCODE -ne 0) { throw "go build $($a.go) failed" }
           }
-          Get-ChildItem dist\*.zip | ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+          Pop-Location
+          Copy-Item dist\keepawake-windows-*.exe, windows\keepawake.ps1, README.md, LICENSE dist\zip
+          Compress-Archive -Path dist\zip\* -DestinationPath dist\keepawake-windows.zip -Force
+          Get-ChildItem dist\keepawake-windows* -File | ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
             Set-Content -Encoding ascii dist\SHA256SUMS.txt
           Get-Content dist\SHA256SUMS.txt
 
@@ -132,4 +150,4 @@ jobs:
           $pre = @()
           if ($env:VERSION.Contains('-')) { $pre = @('--prerelease') }
           gh release create $env:VERSION --title "keepawake $env:VERSION" --generate-notes --verify-tag @pre `
-            (Get-ChildItem dist\*.zip).FullName dist\SHA256SUMS.txt
+            (Get-ChildItem dist\keepawake-windows* -File).FullName dist\SHA256SUMS.txt
