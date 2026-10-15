@@ -70,29 +70,31 @@ namespace KeepAwake {
         [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
         [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
         [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
-        // INPUT with only the MOUSEINPUT arm of the union (the largest), so the size matches sizeof(INPUT).
+        [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+        // INPUT is a union; MOUSEINPUT is its largest arm, so both layouts have sizeof(INPUT).
         [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public MOUSEINPUT mi; }
+        [StructLayout(LayoutKind.Sequential)] struct KEYINPUT { public uint type; public KEYBDINPUT ki; public uint pad1, pad2; }
         [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
-        [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
-        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
-        [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendInput")] static extern uint SendKeys(uint n, KEYINPUT[] inputs, int size);
 
         public static bool Awake() { return SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) != 0; }
         public static bool Release() { return SetThreadExecutionState(ES_CONTINUOUS) != 0; }
 
-        static int Move(int dx) {
-            INPUT[] i = new INPUT[1];
-            i[0].type = 0; i[0].mi.dx = dx; i[0].mi.dwFlags = 1; // INPUT_MOUSE, MOUSEEVENTF_MOVE (relative)
-            return SendInput(1, i, Marshal.SizeOf(typeof(INPUT))) == 1 ? 0 : Marshal.GetLastWin32Error();
-        }
-        // 1 px right and back with real input events; returns 0 or a Win32 error code.
+        // A real (injected) mouse-move event with zero distance: resets the idle timer that
+        // Teams reads (GetLastInputInfo) and the pointer does not move. If that did not reset
+        // idle time, an F15 tap (no app uses F15) is tried. Returns 0 or a Win32 error code.
         public static int Nudge() {
-            POINT start; bool havePos = GetCursorPos(out start);
-            int err = Move(1); if (err != 0) return err;
+            INPUT[] m = new INPUT[1];
+            m[0].type = 0; m[0].mi.dwFlags = 1; // INPUT_MOUSE, MOUSEEVENTF_MOVE, dx = dy = 0
+            if (SendInput(1, m, Marshal.SizeOf(typeof(INPUT))) != 1) return Marshal.GetLastWin32Error();
             System.Threading.Thread.Sleep(50);
-            err = Move(-1); if (err != 0) return err;
-            POINT now;
-            if (havePos && GetCursorPos(out now) && (now.X != start.X || now.Y != start.Y)) SetCursorPos(start.X, start.Y);
+            long idle = IdleMs();
+            if (idle >= 0 && idle < 1000) return 0;
+            KEYINPUT[] k = new KEYINPUT[2];
+            k[0].type = 1; k[0].ki.wVk = 0x7E;                     // INPUT_KEYBOARD, VK_F15 down
+            k[1].type = 1; k[1].ki.wVk = 0x7E; k[1].ki.dwFlags = 2; // KEYEVENTF_KEYUP
+            if (SendKeys(2, k, Marshal.SizeOf(typeof(INPUT))) != 2) return Marshal.GetLastWin32Error();
+            System.Threading.Thread.Sleep(50);
             return 0;
         }
         public static long IdleMs() {
@@ -156,7 +158,7 @@ function Start-KeepAwakeLoop {
         while ($true) {
             $err = & $Platform.Nudge
             if ($err -ne 0 -and -not $warned) {
-                Write-KeepAwakeLog "keepawake: WARNING - mouse nudge failed (Win32 error $err); the PC stays awake but Teams/Slack may go Away."
+                Write-KeepAwakeLog "keepawake: WARNING - input nudge failed (Win32 error $err); the PC stays awake but Teams/Slack may go Away."
                 $warned = $true
             }
             $idle = & $Platform.IdleMs
@@ -182,7 +184,7 @@ function Start-KeepAwakeFallback {
     # No Win32 access: be explicit about what is and is not covered.
     param([string]$Reason, [int]$Every, $Deadline)
     Write-KeepAwakeLog "keepawake: $Reason."
-    Write-KeepAwakeLog '  This script cannot call Windows directly, so it cannot move the pointer or hold a power request.'
+    Write-KeepAwakeLog '  This script cannot call Windows directly, so it cannot send input or hold a power request.'
     $pres = Find-PresentationSettings
     if ($null -eq $pres) {
         Write-KeepAwakeLog '  awake:    NOT covered (PresentationSettings.exe is not available on this Windows edition)'
